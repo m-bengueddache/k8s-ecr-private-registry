@@ -1,12 +1,8 @@
 # Kubernetes — Deploy from a Private AWS ECR Registry
 
-> **FR** — Déploiement d'une application Node.js conteneurisée sur Kubernetes (Minikube) en tirant l'image depuis un registre privé AWS ECR. Mise en place de l'authentification via un Secret Kubernetes de type `dockerconfigjson`, avec deux méthodes de création et analyse du fonctionnement du daemon Docker isolé de Minikube.
+> **FR** — Déploiement d'une application Node.js conteneurisée sur Kubernetes (Minikube) en tirant l'image depuis un registre privé AWS ECR. Authentification via un Secret Kubernetes de type `dockerconfigjson`, avec deux méthodes de création et analyse du daemon Docker isolé de Minikube.
 >
 > **EN** — Deployment of a containerized Node.js application on Kubernetes (Minikube) by pulling the image from a private AWS ECR registry. Authentication is handled via a Kubernetes `dockerconfigjson` Secret, covering two creation methods and an analysis of Minikube's isolated Docker daemon.
-
----
-
-## Stack
 
 ![Kubernetes](https://img.shields.io/badge/Kubernetes-Minikube-326CE5?logo=kubernetes)
 ![Docker](https://img.shields.io/badge/Docker-ECR%20%7C%20Registry-2496ED?logo=docker)
@@ -15,52 +11,109 @@
 
 ---
 
-## FR — Description
+## Problem
 
-### Étape 1 — Build et push vers AWS ECR
+`docker login` on your laptop doesn't help Kubernetes pull a private image — the cluster's container runtime authenticates independently, and if that runtime is Minikube's own isolated Docker daemon, it doesn't even see your host's credentials. Add a registry that issues short-lived tokens (ECR: 12 hours) and "it worked when I tested it" stops being good enough.
 
-Construction de l'image Docker et push vers un dépôt privé AWS ECR. L'image est taguée avec l'URI complète du registre (`<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`). L'authentification ECR se fait via `aws ecr get-login-password | docker login --username AWS --password-stdin <uri>` — `--password-stdin` évite que le token apparaisse dans l'historique shell. Important : Docker doit être configuré en mode credentials inline (`auths` dans `config.json`) plutôt qu'avec un credential store externe (`credsStore`) — seul le mode inline permet de créer un Secret Kubernetes valide.
+## Solution
 
-### Étape 2 — Daemon Docker isolé de Minikube
+The image is built and pushed to a private ECR repository, then pulled into Kubernetes via a `dockerconfigjson` Secret referenced in `imagePullSecrets`. Because Minikube runs its own isolated Docker daemon that doesn't share the host's `~/.docker/config.json`, the ECR login has to happen *inside* Minikube (via `minikube ssh`), with the resulting credentials file copied back out (`minikube cp`) to build the Kubernetes Secret from. Two Secret-creation methods are implemented and validated side by side.
 
-Minikube exécute son propre daemon Docker dans une VM isolée et ne partage pas le `~/.docker/config.json` de l'hôte. L'accès au daemon interne se fait via `minikube ssh`. Après le login ECR depuis l'intérieur de Minikube, le `config.json` généré est copié vers l'hôte WSL avec `minikube cp` pour servir de base au Secret Kubernetes.
+## Architecture
 
-### Étape 3 — Création du Secret Kubernetes
+```mermaid
+flowchart TB
+    subgraph Host["Host (WSL)"]
+        BUILD["docker build + push"] --> ECR[("AWS ECR\nprivate repository")]
+        LOGIN["aws ecr get-login-password\n| docker login --password-stdin"]
+    end
 
-Le composant `Secret` de type `kubernetes.io/dockerconfigjson` fournit à Kubernetes les credentials nécessaires au pull de l'image privée.
+    subgraph MK["Minikube VM — isolated Docker daemon"]
+        LOGIN -. "minikube ssh" .-> MKLOGIN[Login inside Minikube]
+        MKLOGIN --> CFG["config.json"]
+        CFG -- "minikube cp" --> HOSTCFG["copied to host"]
+    end
 
-Deux méthodes de création :
-- Depuis `config.json` (plusieurs registres) : encodage base64 du fichier et injection dans un manifest YAML, ou `kubectl create secret generic --from-file=.dockerconfigjson`
-- Credentials directs (un seul registre) : `kubectl create secret docker-registry` avec `--docker-server`, `--docker-username`, `--docker-password`
+    HOSTCFG --> SECRET["Kubernetes Secret\ndockerconfigjson"]
+    SECRET -->|imagePullSecrets| DEPLOY["Deployment"]
+    DEPLOY -->|"imagePullPolicy: Always"| ECR
+```
 
-Les Secrets sont scoped au namespace — ils doivent être recréés dans chaque namespace qui en a besoin. Les tokens ECR expirent après **12 heures** — automatisation via CronJob recommandée en production. L'erreur `ErrImagePull` observable sans secret disparaît après création.
+## Skills demonstrated
 
-### Étape 4 — Déploiement avec `imagePullSecrets`
+- Diagnosing and working around a real infrastructure quirk (Minikube's daemon isolation) instead of assuming Docker credentials are always host-wide
+- Both `dockerconfigjson`-from-file and direct-credential Secret creation methods, and knowing when each applies (multi-registry vs single-registry)
+- Understanding Secret scoping (namespace-local) and token expiry (ECR: 12h) as operational realities, not edge cases
+- Validating a deployment through the actual event sequence (`kubectl describe pod`: `Pulling` → `Pulled` → `Started`) rather than just "it's running"
 
-Le Secret est référencé dans le manifest Deployment via le champ `imagePullSecrets`. `imagePullPolicy: Always` force un pull à chaque démarrage de pod, même si l'image existe localement. Validation via `kubectl describe pod` (séquence d'événements `Pulling` → `Pulled` → `Started`). Les deux méthodes de création de Secret sont testées en parallèle avec deux Deployments distincts.
+## Key technical decisions
+
+| Decision | Why |
+|---|---|
+| Docker inline credentials (`auths` in `config.json`) instead of a credential store (`credsStore`) | Only the inline format can be base64-encoded directly into a Kubernetes `dockerconfigjson` Secret; external credential stores don't expose the token the same way. |
+| `--password-stdin` for ECR login | Keeps the token out of shell history, unlike passing it as a CLI argument. |
+| `imagePullPolicy: Always` | Forces a fresh pull on every pod start so a stale locally-cached image is never silently reused. |
+
+## Limitations
+
+- ECR tokens expire after 12 hours; there is no automated refresh (a CronJob rotating the Secret would be the production fix).
+- Tested on Minikube only — a managed cluster (EKS) with IRSA would use a different, credential-less pull mechanism entirely.
+
+## Roadmap
+
+- [ ] Add a CronJob that refreshes the ECR-backed Secret before the 12-hour token expiry
+- [ ] Document the IRSA-based alternative for EKS (no Secret needed at all) as a comparison
 
 ---
 
-## EN — Description
+## FR — Détails d'implémentation
 
-### Step 1 — Build and Push to AWS ECR
+### Build et push vers AWS ECR
 
-Build the Docker image and push it to a private AWS ECR repository. The image is tagged with the full registry URI (`<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`). ECR authentication uses `aws ecr get-login-password | docker login --username AWS --password-stdin <uri>` — `--password-stdin` keeps the token out of shell history. One important distinction: Docker must be configured with inline credential storage (`auths` in `config.json`), not an external credential store (`credsStore`) — only inline credentials work for creating a valid Kubernetes Secret.
+L'image est taguée avec l'URI complète du registre. L'authentification ECR se fait via `aws ecr get-login-password | docker login --username AWS --password-stdin <uri>`. Docker doit être configuré en mode credentials inline plutôt qu'avec un credential store externe — seul le mode inline permet de créer un Secret Kubernetes valide.
 
-### Step 2 — Minikube's Isolated Docker Daemon
+### Daemon Docker isolé de Minikube
 
-Minikube runs its own Docker daemon inside an isolated VM and does not share the host's `~/.docker/config.json`. The internal daemon is accessed via `minikube ssh`. After logging in to ECR from inside Minikube, the generated `config.json` is copied to the WSL host via `minikube cp` to use as the Secret source.
+Minikube exécute son propre daemon Docker dans une VM isolée et ne partage pas le `~/.docker/config.json` de l'hôte. L'accès au daemon interne se fait via `minikube ssh`. Après le login ECR depuis l'intérieur de Minikube, le `config.json` généré est copié vers l'hôte avec `minikube cp`.
 
-### Step 3 — Creating the Kubernetes Secret
+### Création du Secret Kubernetes
 
-The `Secret` of type `kubernetes.io/dockerconfigjson` gives Kubernetes the credentials needed to pull the private image.
+Deux méthodes : depuis `config.json` (encodage base64 + manifest YAML, ou `kubectl create secret generic --from-file`), ou credentials directs (`kubectl create secret docker-registry`). Les tokens ECR expirent après 12 heures.
 
-Two creation methods:
-- From `config.json` (multiple registries): base64-encode the file and inject into a YAML manifest, or use `kubectl create secret generic --from-file=.dockerconfigjson`
-- Direct credentials (single registry): `kubectl create secret docker-registry` with `--docker-server`, `--docker-username`, `--docker-password`
+### Déploiement avec `imagePullSecrets`
 
-Secrets are namespace-scoped — they must be recreated in each namespace that needs them. ECR tokens expire after **12 hours** — a CronJob is the recommended production solution. The `ErrImagePull` error is visible without the secret and clears up immediately after creation.
+Le Secret est référencé dans le manifest Deployment. `imagePullPolicy: Always` force un pull à chaque démarrage de pod. Validation via `kubectl describe pod`.
 
-### Step 4 — Deployment with `imagePullSecrets`
+## EN — Implementation Details
 
-The Secret is referenced in the Deployment manifest via `imagePullSecrets`. `imagePullPolicy: Always` forces a fresh pull on every pod start, even if the image exists locally. Deployment is validated via `kubectl describe pod` (event sequence: `Pulling` → `Pulled` → `Started`). Both Secret creation methods are tested in parallel with two separate Deployments.
+### Build and Push to AWS ECR
+
+The image is tagged with the full registry URI. ECR authentication uses `aws ecr get-login-password | docker login --username AWS --password-stdin <uri>`. Docker must use inline credential storage rather than an external credential store — only inline credentials work for creating a valid Kubernetes Secret.
+
+### Minikube's Isolated Docker Daemon
+
+Minikube runs its own Docker daemon inside an isolated VM and does not share the host's `~/.docker/config.json`. The internal daemon is accessed via `minikube ssh`. After logging in to ECR from inside Minikube, the generated `config.json` is copied to the host via `minikube cp`.
+
+### Creating the Kubernetes Secret
+
+Two methods: from `config.json` (base64-encode + YAML manifest, or `kubectl create secret generic --from-file`), or direct credentials (`kubectl create secret docker-registry`). ECR tokens expire after 12 hours.
+
+### Deployment with `imagePullSecrets`
+
+The Secret is referenced in the Deployment manifest. `imagePullPolicy: Always` forces a fresh pull on every pod start. Validated via `kubectl describe pod`.
+
+---
+
+## Prerequisites
+
+- Minikube, `kubectl`, `aws-cli` with ECR access
+
+## Project Structure
+
+```
+.
+├── Dockerfile          # Node.js app image
+├── app/                # Application source
+├── deployment.yaml     # Deployment referencing imagePullSecrets
+└── docker-secret.yaml  # dockerconfigjson Secret template
+```
